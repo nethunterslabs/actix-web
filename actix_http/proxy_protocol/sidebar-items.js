@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Command","Protocol","ProxyProtocol","TlvType","V1Addresses","V2Addresses"],"struct":["ProxyProtocolV1","ProxyProtocolV2","Tlv"]};

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `ServiceConfigBuilder::{h2_max_header_list_size, h2_max_concurrent_streams}` and the matching `HttpServiceBuilder` methods, which set HTTP/2's `SETTINGS_MAX_HEADER_LIST_SIZE` and `SETTINGS_MAX_CONCURRENT_STREAMS` on server connections. Both default to unset, which keeps today's behaviour.
+
 ## 3.18.12
 
 - Flush compressed response bodies when the source is pending.

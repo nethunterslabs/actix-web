@@ -114,7 +114,7 @@ where
             match Pin::new(&mut this.connection).poll_accept(cx)? {
                 Poll::Ready(Some((req, tx))) => {
                     let (parts, body) = req.into_parts();
-                    let payload = crate::h2::Payload::new(body);
+                    let (payload, drain) = crate::h2::Payload::with_drain(body);
                     let pl = Payload::H2 { payload };
                     let mut req = Request::with_payload(pl);
                     let head_req = parts.method == Method::HEAD;
@@ -134,13 +134,29 @@ where
                     // multiplex request handling with spawn task
                     tokio::task::spawn_local(async move {
                         // resolve service call and send response.
-                        let res = match fut.await {
-                            Ok(res) => handle_response(res.into(), tx, config, head_req).await,
-                            Err(err) => {
-                                let res: Response<BoxBody> = err.into();
-                                handle_response(res, tx, config, head_req).await
+                        let respond = async move {
+                            match fut.await {
+                                Ok(res) => handle_response(res.into(), tx, config, head_req).await,
+                                Err(err) => {
+                                    let res: Response<BoxBody> = err.into();
+                                    handle_response(res, tx, config, head_req).await
+                                }
                             }
                         };
+
+                        // drain the request body alongside, so empty DATA frames do not queue
+                        // while the handler is not reading it (RUSTSEC-2026-0258)
+                        let mut respond = pin!(respond);
+                        let mut drain = Some(drain);
+                        let res = poll_fn(|cx| {
+                            if let Some(pending) = drain.as_mut() {
+                                if Pin::new(pending).poll(cx).is_ready() {
+                                    drain = None;
+                                }
+                            }
+                            respond.as_mut().poll(cx)
+                        })
+                        .await;
 
                         // log error.
                         if let Err(err) = res {

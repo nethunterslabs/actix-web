@@ -967,6 +967,59 @@ async fn h2c_auto() {
     srv.stop().await;
 }
 
+/// A handler that reads its body only after a while still gets all of it, split by empty
+/// DATA frames that the dispatcher drained and dropped meanwhile (RUSTSEC-2026-0258).
+#[actix_rt::test]
+async fn h2_body_read_late_survives_empty_data_frames() {
+    let mut srv = test_server(|| {
+        HttpService::build()
+            .keep_alive(KeepAlive::Disabled)
+            .finish(|mut req: Request| async move {
+                sleep(Duration::from_millis(500)).await;
+                let mut body = Vec::new();
+                let mut chunks = 0;
+                while let Some(item) = req.take_payload().next().await {
+                    let chunk = item?;
+                    assert!(!chunk.is_empty(), "an empty chunk reached the handler");
+                    body.extend_from_slice(&chunk);
+                    chunks += 1;
+                }
+                assert!(chunks <= 2, "{chunks} chunks");
+                Ok::<_, Error>(Response::ok().set_body(body))
+            })
+            .tcp_auto_h2c()
+    })
+    .await;
+
+    let tcp = TcpStream::connect(srv.addr()).await.unwrap();
+    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move { connection.await.unwrap() });
+    let mut h2 = h2.ready().await.unwrap();
+
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .body(())
+        .unwrap();
+    let (response, mut send) = h2.send_request(request, false).unwrap();
+    send.send_data(Bytes::from_static(b"hello "), false)
+        .unwrap();
+    for _ in 0..10_000 {
+        send.send_data(Bytes::new(), false).unwrap();
+    }
+    send.send_data(Bytes::from_static(b"world"), true).unwrap();
+
+    let (head, mut body) = response.await.unwrap().into_parts();
+    assert!(head.status.is_success());
+    let mut received = Vec::new();
+    while let Some(chunk) = body.data().await {
+        received.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(received, b"hello world");
+
+    srv.stop().await;
+}
+
 #[actix_rt::test]
 async fn h2_flow_control_window_sizes() {
     let mut srv = test_server(|| {

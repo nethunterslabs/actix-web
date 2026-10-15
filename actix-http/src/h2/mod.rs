@@ -3,11 +3,12 @@
 use std::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    sync::{Arc, Mutex, MutexGuard, Weak},
+    task::{Context, Poll, Waker},
 };
 
 use actix_codec::{AsyncRead, AsyncWrite};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_core::{ready, Stream};
 use h2::{
     server::{Builder, Connection, Handshake},
@@ -26,13 +27,94 @@ mod service;
 pub use self::{dispatcher::Dispatcher, service::H2Service};
 
 /// HTTP/2 peer stream.
+///
+/// While the dispatcher's task for the request runs, a [`Drain`] reads the stream on the
+/// handler's behalf: empty DATA frames are discarded as they arrive, and data is held here
+/// until the handler reads it. Without it, h2 0.3 queues every empty DATA frame of a body
+/// nobody is reading, and an empty frame takes no flow-control window, so the queue grows
+/// with what the peer sends (RUSTSEC-2026-0258). What is held here is bounded by the
+/// stream's flow-control window, because capacity is released only when the handler reads
+/// the data.
 pub struct Payload {
+    shared: Arc<Mutex<Shared>>,
+}
+
+struct Shared {
     stream: RecvStream,
+    /// Data drained from the stream that the handler has not read yet.
+    held: Held,
+    /// An error the drain met, for the handler's next read.
+    error: Option<PayloadError>,
+    /// The drain has seen the end of the stream, or an error.
+    ended: bool,
+    /// A [`Drain`] is reading the stream for this payload.
+    draining: bool,
+    /// The task waiting to read, woken when the drain holds data or the end.
+    reader: Option<Waker>,
+}
+
+/// Drained data, kept as the chunk it arrived in while there is only one, so a handler that
+/// keeps up with its body costs no copy.
+enum Held {
+    Nothing,
+    One(Bytes),
+    Many(BytesMut),
+}
+
+impl Held {
+    fn push(&mut self, chunk: Bytes) {
+        *self = match std::mem::replace(self, Held::Nothing) {
+            Held::Nothing => Held::One(chunk),
+            Held::One(first) => {
+                let mut many = BytesMut::with_capacity(first.len() + chunk.len());
+                many.extend_from_slice(&first);
+                many.extend_from_slice(&chunk);
+                Held::Many(many)
+            }
+            Held::Many(mut many) => {
+                many.extend_from_slice(&chunk);
+                Held::Many(many)
+            }
+        };
+    }
+
+    fn take(&mut self) -> Option<Bytes> {
+        match std::mem::replace(self, Held::Nothing) {
+            Held::Nothing => None,
+            Held::One(chunk) => Some(chunk),
+            Held::Many(many) => Some(many.freeze()),
+        }
+    }
+}
+
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Payload {
     pub(crate) fn new(stream: RecvStream) -> Self {
-        Self { stream }
+        Self {
+            shared: Arc::new(Mutex::new(Shared {
+                stream,
+                held: Held::Nothing,
+                error: None,
+                ended: false,
+                draining: false,
+                reader: None,
+            })),
+        }
+    }
+
+    /// A payload and the [`Drain`] that reads its stream while the handler does not.
+    pub(crate) fn with_drain(stream: RecvStream) -> (Self, Drain) {
+        let payload = Self::new(stream);
+        lock(&payload.shared).draining = true;
+        let drain = Drain {
+            shared: Arc::downgrade(&payload.shared),
+        };
+        (payload, drain)
     }
 }
 
@@ -40,19 +122,104 @@ impl Stream for Payload {
     type Item = Result<Bytes, PayloadError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
+        let mut shared = lock(&self.shared);
+        let shared = &mut *shared;
 
-        match ready!(Pin::new(&mut this.stream).poll_data(cx)) {
-            Some(Ok(chunk)) => {
-                let len = chunk.len();
+        let chunk = match shared.held.take() {
+            Some(chunk) => chunk,
+            None if shared.error.is_some() => return Poll::Ready(shared.error.take().map(Err)),
+            None if shared.ended => return Poll::Ready(None),
+            None if shared.draining => {
+                // the drain is registered with the stream and wakes this task
+                if !shared
+                    .reader
+                    .as_ref()
+                    .is_some_and(|reader| reader.will_wake(cx.waker()))
+                {
+                    shared.reader = Some(cx.waker().clone());
+                }
+                return Poll::Pending;
+            }
+            None => loop {
+                match ready!(Pin::new(&mut shared.stream).poll_data(cx)) {
+                    Some(Ok(chunk)) if chunk.is_empty() => continue,
+                    Some(Ok(chunk)) => break chunk,
+                    Some(Err(err)) => return Poll::Ready(Some(Err(err.into()))),
+                    None => return Poll::Ready(None),
+                }
+            },
+        };
 
-                match this.stream.flow_control().release_capacity(len) {
-                    Ok(()) => Poll::Ready(Some(Ok(chunk))),
-                    Err(err) => Poll::Ready(Some(Err(err.into()))),
+        match shared.stream.flow_control().release_capacity(chunk.len()) {
+            Ok(()) => Poll::Ready(Some(Ok(chunk))),
+            Err(err) => Poll::Ready(Some(Err(err.into()))),
+        }
+    }
+}
+
+/// Reads a request's stream for its [`Payload`] while the handler runs. Completes at the end
+/// of the stream or once the payload is dropped; dropping it hands the stream back to the
+/// payload, which then reads it itself.
+pub(crate) struct Drain {
+    shared: Weak<Mutex<Shared>>,
+}
+
+impl Future for Drain {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Poll::Ready(());
+        };
+        let mut shared = lock(&shared);
+        let shared = &mut *shared;
+
+        let mut held_more = false;
+        let done = loop {
+            match Pin::new(&mut shared.stream).poll_data(cx) {
+                Poll::Pending => break false,
+                Poll::Ready(Some(Ok(chunk))) => {
+                    // an empty frame carries nothing for the handler; dropping it here is
+                    // what keeps h2 from queuing it
+                    if !chunk.is_empty() {
+                        shared.held.push(chunk);
+                        held_more = true;
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    shared.error = Some(err.into());
+                    shared.ended = true;
+                    break true;
+                }
+                Poll::Ready(None) => {
+                    shared.ended = true;
+                    break true;
                 }
             }
-            Some(Err(err)) => Poll::Ready(Some(Err(err.into()))),
-            None => Poll::Ready(None),
+        };
+
+        if held_more || done {
+            if let Some(reader) = shared.reader.take() {
+                reader.wake();
+            }
+        }
+
+        if done {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            let mut shared = lock(&shared);
+            shared.draining = false;
+            if let Some(reader) = shared.reader.take() {
+                reader.wake();
+            }
         }
     }
 }

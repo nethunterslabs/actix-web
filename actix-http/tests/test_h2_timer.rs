@@ -168,6 +168,11 @@ fn idle_server() -> (std::net::SocketAddr, actix_server::ServerHandle) {
                     HttpService::build()
                         .keep_alive(Duration::from_secs(1))
                         .h2(|req: actix_http::Request| async move {
+                            if req.path() == "/body" {
+                                return Ok::<_, Error>(
+                                    Response::ok().set_body("hello").map_into_boxed_body(),
+                                );
+                            }
                             if req.path() != "/slow" {
                                 return Ok::<_, Error>(Response::ok());
                             }
@@ -269,5 +274,192 @@ async fn h2_open_stream_outlasting_keep_alive_is_not_cut() {
         .expect("connection still open 5 s after its last stream ended")
         .unwrap();
 
+    handle.stop(false).await;
+}
+
+/// What a raw h2 client saw before the server closed the connection or its limit passed.
+#[derive(Debug)]
+struct Held {
+    /// How long the connection stayed open, or `None` if it outlived the limit.
+    closed_after: Option<Duration>,
+    goaways: usize,
+}
+
+/// h2's fixed payload for the PING it sends during graceful shutdown.
+const SHUTDOWN_PING: [u8; 8] = [0x0b, 0x7b, 0xa2, 0xf0, 0x8b, 0x9b, 0xfe, 0x54];
+
+fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u32;
+    let mut out = len.to_be_bytes()[1..].to_vec();
+    out.extend([kind, flags]);
+    out.extend(stream.to_be_bytes());
+    out.extend(payload);
+    out
+}
+
+/// A hand-written h2 client, so the test decides which PINGs it acks and what window it
+/// advertises (the h2 crate acks every PING). It acks SETTINGS and every PING except h2's
+/// shutdown one unless `ack_shutdown`; with `zero_window` it advertises
+/// SETTINGS_INITIAL_WINDOW_SIZE = 0 and never sends WINDOW_UPDATE; with `path` it sends one
+/// GET for it. Returns once the server closes the connection or after `limit`.
+fn raw_hold(
+    addr: std::net::SocketAddr,
+    ack_shutdown: bool,
+    zero_window: bool,
+    path: Option<&str>,
+    limit: Duration,
+) -> Held {
+    use std::io::{ErrorKind, Read, Write};
+
+    let mut sock = std::net::TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let closed = |goaways| Held {
+        closed_after: Some(start.elapsed()),
+        goaways,
+    };
+
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    let settings: &[u8] = if zero_window {
+        &[0, 4, 0, 0, 0, 0]
+    } else {
+        &[]
+    };
+    hello.extend(frame(0x4, 0, 0, settings));
+    if let Some(path) = path {
+        // :method GET and :scheme http indexed, :path and :authority as literals.
+        let mut block = vec![0x82, 0x86, 0x04, path.len() as u8];
+        block.extend(path.as_bytes());
+        block.extend([0x01, 9]);
+        block.extend(b"localhost");
+        // END_HEADERS | END_STREAM
+        hello.extend(frame(0x1, 0x4 | 0x1, 1, &block));
+    }
+    sock.write_all(&hello).unwrap();
+
+    let mut buf = Vec::new();
+    let mut goaways = 0;
+    let mut chunk = [0u8; 4096];
+    while start.elapsed() < limit {
+        match sock.read(&mut chunk) {
+            Ok(0) => return closed(goaways),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                continue
+            }
+            Err(_) => return closed(goaways),
+        }
+
+        while buf.len() >= 9 {
+            let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+            if buf.len() < 9 + len {
+                break;
+            }
+            let (kind, flags) = (buf[3], buf[4]);
+            let payload = buf[9..9 + len].to_vec();
+            buf.drain(..9 + len);
+
+            let reply = match kind {
+                0x4 if flags & 0x1 == 0 => Some(frame(0x4, 0x1, 0, &[])),
+                0x6 if flags & 0x1 == 0 && (ack_shutdown || payload != SHUTDOWN_PING) => {
+                    Some(frame(0x6, 0x1, 0, &payload))
+                }
+                0x7 => {
+                    goaways += 1;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(reply) = reply {
+                if sock.write_all(&reply).is_err() {
+                    return closed(goaways);
+                }
+            }
+        }
+    }
+
+    Held {
+        closed_after: None,
+        goaways,
+    }
+}
+
+/// Runs `raw_hold` against the 1 s keep-alive server with an 8 s limit.
+async fn hold(
+    addr: std::net::SocketAddr,
+    ack_shutdown: bool,
+    zero_window: bool,
+    path: Option<&'static str>,
+) -> Held {
+    tokio::task::spawn_blocking(move || {
+        raw_hold(
+            addr,
+            ack_shutdown,
+            zero_window,
+            path,
+            Duration::from_secs(8),
+        )
+    })
+    .await
+    .unwrap()
+}
+
+/// Asserts the connection was closed within `within` of opening, after `goaways` GOAWAYs.
+fn assert_closed(held: &Held, within: Duration, goaways: usize) {
+    let closed = held
+        .closed_after
+        .unwrap_or_else(|| panic!("connection held past the limit: {held:?}"));
+    assert!(
+        closed < within,
+        "closed after {closed:?}, want under {within:?}"
+    );
+    assert_eq!(held.goaways, goaways, "{held:?}");
+}
+
+/// The cooperative case through the raw client, so each test below differs from it in one
+/// thing: GOAWAY at keep-alive (1 s), the shutdown PING acked, the final GOAWAY, close.
+#[actix_rt::test]
+async fn h2_raw_client_acking_every_ping_is_closed() {
+    let (addr, handle) = idle_server();
+    assert_closed(
+        &hold(addr, true, false, None).await,
+        Duration::from_secs(2),
+        2,
+    );
+    handle.stop(false).await;
+}
+
+/// A client that acks the keep-alive PINGs but never h2's shutdown PING is still closed, with
+/// and without a request first. h2 0.3 sends no user PING while its shutdown PING waits for an
+/// ack (`proto/ping_pong.rs`, `send_pending_ping`), so the keep-alive PING goes unanswered and
+/// its deadline closes the connection one keep-alive after the GOAWAY. hisn #4284.
+#[actix_rt::test]
+async fn h2_idle_connection_withholding_shutdown_ping_ack_is_closed() {
+    let (addr, handle) = idle_server();
+    assert_closed(
+        &hold(addr, false, false, None).await,
+        Duration::from_secs(4),
+        1,
+    );
+    assert_closed(
+        &hold(addr, false, false, Some("/")).await,
+        Duration::from_secs(4),
+        1,
+    );
+    handle.stop(false).await;
+}
+
+/// A client that advertises a zero window and asks for a non-empty body holds the connection:
+/// the response waits on `poll_capacity` with no deadline, so its stream counts as open and the
+/// idle close never starts. hisn #4284; the fix route is not yet decided.
+#[actix_rt::test]
+#[ignore = "reproduces hisn #4284: a zero-window stream holds the connection"]
+async fn h2_zero_window_stream_does_not_hold_connection() {
+    let (addr, handle) = idle_server();
+    let held = hold(addr, true, true, Some("/body")).await;
+    assert!(held.closed_after.is_some(), "{held:?}");
+    let held = hold(addr, false, true, Some("/body")).await;
+    assert!(held.closed_after.is_some(), "{held:?}");
     handle.stop(false).await;
 }

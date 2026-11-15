@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Close an HTTP/2 connection with GOAWAY once it has had no open stream for the keep-alive duration. PINGs only showed the peer was alive, so a peer that answered them held an idle connection for ever; HTTP/1.1 already closed after keep-alive. `KeepAlive::Os` and `KeepAlive::Disabled` keep the old behaviour.
 - Add `ServiceConfigBuilder::{h2_max_header_list_size, h2_max_concurrent_streams}` and the matching `HttpServiceBuilder` methods, which set HTTP/2's `SETTINGS_MAX_HEADER_LIST_SIZE` and `SETTINGS_MAX_CONCURRENT_STREAMS` on server connections. Both default to unset, which keeps today's behaviour.
 
 ## 3.21.3

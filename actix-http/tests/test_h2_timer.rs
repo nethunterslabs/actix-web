@@ -152,8 +152,9 @@ async fn h2_handshake_timeout() -> io::Result<()> {
     Ok(())
 }
 
-/// Starts an h2 server with a 1 s keep-alive whose handler answers `/slow` with six chunks
-/// half a second apart (3 s in all) and anything else with an empty 200.
+/// Starts an h2 server with a 1 s keep-alive and a 1 s send stall timeout whose handler answers
+/// `/slow` with six chunks half a second apart (3 s in all), `/gap` with two chunks 2 s apart,
+/// `/body` with a 5-byte body and anything else with an empty 200.
 fn idle_server() -> (std::net::SocketAddr, actix_server::ServerHandle) {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let lst = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -167,10 +168,23 @@ fn idle_server() -> (std::net::SocketAddr, actix_server::ServerHandle) {
                 .listen("h2_idle", lst, || {
                     HttpService::build()
                         .keep_alive(Duration::from_secs(1))
+                        .h2_send_stall_timeout(Duration::from_secs(1))
                         .h2(|req: actix_http::Request| async move {
                             if req.path() == "/body" {
                                 return Ok::<_, Error>(
                                     Response::ok().set_body("hello").map_into_boxed_body(),
+                                );
+                            }
+                            if req.path() == "/gap" {
+                                let body = async_stream::stream! {
+                                    yield Ok::<_, Error>(bytes::Bytes::from_static(b"one"));
+                                    actix_rt::time::sleep(Duration::from_secs(2)).await;
+                                    yield Ok::<_, Error>(bytes::Bytes::from_static(b"two"));
+                                };
+                                return Ok::<_, Error>(
+                                    Response::ok()
+                                        .set_body(actix_http::body::BodyStream::new(body))
+                                        .map_into_boxed_body(),
                                 );
                             }
                             if req.path() != "/slow" {
@@ -283,6 +297,7 @@ struct Held {
     /// How long the connection stayed open, or `None` if it outlived the limit.
     closed_after: Option<Duration>,
     goaways: usize,
+    resets: usize,
 }
 
 /// h2's fixed payload for the PING it sends during graceful shutdown.
@@ -315,9 +330,10 @@ fn raw_hold(
     sock.set_read_timeout(Some(Duration::from_millis(50)))
         .unwrap();
     let start = std::time::Instant::now();
-    let closed = |goaways| Held {
+    let closed = |goaways, resets| Held {
         closed_after: Some(start.elapsed()),
         goaways,
+        resets,
     };
 
     let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
@@ -340,15 +356,16 @@ fn raw_hold(
 
     let mut buf = Vec::new();
     let mut goaways = 0;
+    let mut resets = 0;
     let mut chunk = [0u8; 4096];
     while start.elapsed() < limit {
         match sock.read(&mut chunk) {
-            Ok(0) => return closed(goaways),
+            Ok(0) => return closed(goaways, resets),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 continue
             }
-            Err(_) => return closed(goaways),
+            Err(_) => return closed(goaways, resets),
         }
 
         while buf.len() >= 9 {
@@ -365,6 +382,10 @@ fn raw_hold(
                 0x6 if flags & 0x1 == 0 && (ack_shutdown || payload != SHUTDOWN_PING) => {
                     Some(frame(0x6, 0x1, 0, &payload))
                 }
+                0x3 => {
+                    resets += 1;
+                    None
+                }
                 0x7 => {
                     goaways += 1;
                     None
@@ -373,7 +394,7 @@ fn raw_hold(
             };
             if let Some(reply) = reply {
                 if sock.write_all(&reply).is_err() {
-                    return closed(goaways);
+                    return closed(goaways, resets);
                 }
             }
         }
@@ -382,6 +403,7 @@ fn raw_hold(
     Held {
         closed_after: None,
         goaways,
+        resets,
     }
 }
 
@@ -430,36 +452,98 @@ async fn h2_raw_client_acking_every_ping_is_closed() {
     handle.stop(false).await;
 }
 
-/// A client that acks the keep-alive PINGs but never h2's shutdown PING is still closed, with
-/// and without a request first. h2 0.3 sends no user PING while its shutdown PING waits for an
-/// ack (`proto/ping_pong.rs`, `send_pending_ping`), so the keep-alive PING goes unanswered and
-/// its deadline closes the connection one keep-alive after the GOAWAY. hisn #4284.
+/// A client that acks the keep-alive PINGs but never h2's shutdown PING is closed one keep-alive
+/// after the GOAWAY, with and without a request first, by the dispatcher's hard close, whose
+/// GOAWAY(NO_ERROR) is the second one counted. h2 0.3 would also close it then, because it sends
+/// no user PING while its shutdown PING waits for an ack (`proto/ping_pong.rs`,
+/// `send_pending_ping`) and the keep-alive PING deadline passes, but the hard close does not
+/// rest on that. hisn #4284.
 #[actix_rt::test]
 async fn h2_idle_connection_withholding_shutdown_ping_ack_is_closed() {
     let (addr, handle) = idle_server();
     assert_closed(
         &hold(addr, false, false, None).await,
         Duration::from_secs(4),
-        1,
+        2,
     );
     assert_closed(
         &hold(addr, false, false, Some("/")).await,
         Duration::from_secs(4),
-        1,
+        2,
     );
     handle.stop(false).await;
 }
 
-/// A client that advertises a zero window and asks for a non-empty body holds the connection:
-/// the response waits on `poll_capacity` with no deadline, so its stream counts as open and the
-/// idle close never starts. hisn #4284; the fix route is not yet decided.
+/// A client that advertises a zero window and asks for a non-empty body no longer holds the
+/// connection: the response waits on `poll_capacity`, the send stall timeout (1 s) resets that
+/// stream, and the idle close then runs as for any connection, with or without the shutdown
+/// PING acked. Before the stall timeout it was held past the 8 s limit. hisn #4284.
 #[actix_rt::test]
-#[ignore = "reproduces hisn #4284: a zero-window stream holds the connection"]
 async fn h2_zero_window_stream_does_not_hold_connection() {
     let (addr, handle) = idle_server();
-    let held = hold(addr, true, true, Some("/body")).await;
-    assert!(held.closed_after.is_some(), "{held:?}");
-    let held = hold(addr, false, true, Some("/body")).await;
-    assert!(held.closed_after.is_some(), "{held:?}");
+    for ack_shutdown in [true, false] {
+        let held = hold(addr, ack_shutdown, true, Some("/body")).await;
+        assert_closed(&held, Duration::from_secs(5), 2);
+        assert_eq!(held.resets, 1, "{held:?}");
+    }
+    handle.stop(false).await;
+}
+
+/// The stall reset cuts only the stalled stream: the connection answers the next request.
+#[actix_rt::test]
+async fn h2_zero_window_reset_leaves_the_connection_serving() {
+    let (addr, handle) = idle_server();
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut tx, conn) = h2::client::Builder::new()
+        .initial_window_size(0)
+        .handshake::<_, bytes::Bytes>(stream)
+        .await
+        .unwrap();
+    let closed = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let (res, _) = tx.send_request(get("/body"), true).unwrap();
+    let res = res.await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let started = std::time::Instant::now();
+    let mut body = res.into_body();
+    let err = tokio::time::timeout(Duration::from_secs(5), body.data())
+        .await
+        .expect("stream still waiting for window after 5 s")
+        .expect("body ended without a reset")
+        .expect_err("data arrived through a zero window");
+    assert_eq!(err.reason(), Some(h2::Reason::CANCEL), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let (res, _) = tx.send_request(get("/"), true).unwrap();
+    assert_eq!(res.await.unwrap().status().as_u16(), 200);
+    assert!(!closed.is_finished());
+
+    drop(tx);
+    handle.stop(false).await;
+}
+
+/// The stall clock runs only while the stream waits for window: a handler that takes 2 s,
+/// twice the stall timeout, between chunks of a stream with an open window is not reset.
+#[actix_rt::test]
+async fn h2_slow_handler_with_open_window_is_not_reset() {
+    let (addr, handle) = idle_server();
+    let (mut tx, _closed) = idle_client(addr).await;
+
+    let (res, _) = tx.send_request(get("/gap"), true).unwrap();
+    let mut body = res.await.unwrap().into_body();
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("stream reset while its handler was slow");
+        let _ = body.flow_control().release_capacity(chunk.len());
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, b"onetwo");
+
     handle.stop(false).await;
 }

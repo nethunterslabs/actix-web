@@ -195,6 +195,19 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Sets how long an HTTP/2 response may wait for the peer to open its flow-control window.
+    ///
+    /// A response stream that has data to send and gets no window from the peer for this long
+    /// is reset with `RST_STREAM(CANCEL)`; the connection and its other streams carry on. The
+    /// clock runs only while the stream waits for window, so a handler that is slow to produce
+    /// its body is never cut by it, and it starts again each time window arrives.
+    ///
+    /// The default value of `None` waits for ever, which keeps today's behaviour.
+    pub fn h2_send_stall_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.inner.h2_send_stall_timeout = timeout;
+        self
+    }
+
     /// Builds a [`ServiceConfig`] from this [`ServiceConfigBuilder`] instance
     pub fn build(self) -> ServiceConfig {
         ServiceConfig(Rc::new(self.inner))
@@ -220,6 +233,7 @@ struct Inner {
     h2_stream_window_size: u32,
     h2_max_header_list_size: Option<u32>,
     h2_max_concurrent_streams: Option<u32>,
+    h2_send_stall_timeout: Option<Duration>,
     graceful_shutdown_signal: Option<GracefulShutdownSignal>,
 }
 
@@ -239,6 +253,7 @@ impl Default for Inner {
             h2_stream_window_size: DEFAULT_H2_STREAM_WINDOW_SIZE,
             h2_max_header_list_size: None,
             h2_max_concurrent_streams: None,
+            h2_send_stall_timeout: None,
             graceful_shutdown_signal: None,
         }
     }
@@ -267,6 +282,7 @@ impl ServiceConfig {
             h2_stream_window_size: DEFAULT_H2_STREAM_WINDOW_SIZE,
             h2_max_header_list_size: None,
             h2_max_concurrent_streams: None,
+            h2_send_stall_timeout: None,
             graceful_shutdown_signal: None,
         }))
     }
@@ -362,6 +378,12 @@ impl ServiceConfig {
     /// HTTP/2 maximum number of concurrent streams per connection, if set.
     pub fn h2_max_concurrent_streams(&self) -> Option<u32> {
         self.0.h2_max_concurrent_streams
+    }
+
+    /// How long an HTTP/2 response may wait for flow-control window before its stream is reset,
+    /// if set.
+    pub fn h2_send_stall_timeout(&self) -> Option<Duration> {
+        self.0.h2_send_stall_timeout
     }
 
     pub(crate) fn now(&self) -> Instant {

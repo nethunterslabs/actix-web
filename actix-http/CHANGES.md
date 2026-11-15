@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `ServiceConfigBuilder::h2_send_stall_timeout` and `HttpServiceBuilder::h2_send_stall_timeout`: an HTTP/2 response stream that waits that long for the peer to open its flow-control window is reset with `RST_STREAM(CANCEL)`, so a peer advertising a zero window can no longer hold the stream, and with it the connection, open for ever. Only time spent waiting for window counts. Defaults to unset, which keeps today's behaviour.
+- Close an HTTP/2 connection one keep-alive after the idle close's GOAWAY if the graceful close has not finished by then, so a peer that never completes it is still closed.
 - Close an HTTP/2 connection with GOAWAY once it has had no open stream for the keep-alive duration. PINGs only showed the peer was alive, so a peer that answered them held an idle connection for ever; HTTP/1.1 already closed after keep-alive. `KeepAlive::Os` and `KeepAlive::Disabled` keep the old behaviour.
 - Add `ServiceConfigBuilder::{h2_max_header_list_size, h2_max_concurrent_streams}` and the matching `HttpServiceBuilder` methods, which set HTTP/2's `SETTINGS_MAX_HEADER_LIST_SIZE` and `SETTINGS_MAX_CONCURRENT_STREAMS` on server connections. Both default to unset, which keeps today's behaviour.
 

@@ -1,4 +1,5 @@
 use std::{
+    cell::{Cell, RefCell},
     cmp,
     error::Error as StdError,
     future::Future,
@@ -6,7 +7,8 @@ use std::{
     net,
     pin::{pin, Pin},
     rc::Rc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use actix_codec::{AsyncRead, AsyncWrite};
@@ -42,6 +44,7 @@ pin_project! {
         config: ServiceConfig,
         peer_addr: Option<net::SocketAddr>,
         ping_pong: Option<H2PingPong>,
+        idle: Option<H2Idle>,
         graceful_shutdown: Option<GracefulShutdownFuture>,
         _phantom: PhantomData<B>
     }
@@ -71,6 +74,13 @@ where
             ping_pong: conn.ping_pong().unwrap(),
         });
 
+        let idle = config.keep_alive().duration().map(|dur| H2Idle {
+            streams: Rc::new(OpenStreams::default()),
+            timer: Box::pin(sleep(dur)),
+            armed: false,
+            dur,
+        });
+
         let graceful_shutdown = config.graceful_shutdown();
 
         Self {
@@ -80,6 +90,7 @@ where
             connection: conn,
             conn_data: conn_data.0.map(Rc::new),
             ping_pong,
+            idle,
             graceful_shutdown,
             _phantom: PhantomData,
         }
@@ -99,6 +110,72 @@ where
             // round trip. `poll_accept` keeps driving in-flight streams and returns `None` once
             // they have all finished.
             self.connection.graceful_shutdown();
+        }
+    }
+}
+
+/// Closes a connection that has had no open stream for the keep-alive duration.
+///
+/// PINGs only prove the peer is alive, so a peer that answers them would otherwise hold a
+/// connection with no streams for ever. HTTP/1.1 closes such a connection after its keep-alive;
+/// this gives HTTP/2 the same bound.
+struct H2Idle {
+    /// Streams whose request is being handled, shared with their tasks.
+    streams: Rc<OpenStreams>,
+
+    /// Fires when the connection has been idle for `dur`.
+    timer: Pin<Box<Sleep>>,
+
+    /// True while `timer` counts an idle period that has started.
+    armed: bool,
+
+    dur: Duration,
+}
+
+impl H2Idle {
+    /// Returns true once the connection has had no open stream for `dur`.
+    fn poll_idle(&mut self, now: std::time::Instant, cx: &mut Context<'_>) -> bool {
+        if self.streams.open.get() > 0 {
+            self.armed = false;
+            // woken by the last stream to finish, so the idle period starts then.
+            *self.streams.waker.borrow_mut() = Some(cx.waker().clone());
+            return false;
+        }
+
+        if !self.armed {
+            self.timer.as_mut().reset((now + self.dur).into());
+            self.armed = true;
+        }
+
+        self.timer.as_mut().poll(cx).is_ready()
+    }
+}
+
+#[derive(Default)]
+struct OpenStreams {
+    open: Cell<usize>,
+    waker: RefCell<Option<Waker>>,
+}
+
+/// Counts one stream as open for as long as it lives.
+struct OpenStream(Rc<OpenStreams>);
+
+impl OpenStream {
+    fn new(streams: &Rc<OpenStreams>) -> Self {
+        streams.open.set(streams.open.get() + 1);
+        Self(Rc::clone(streams))
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        let open = self.0.open.get() - 1;
+        self.0.open.set(open);
+
+        if open == 0 {
+            if let Some(waker) = self.0.waker.borrow_mut().take() {
+                waker.wake();
+            }
         }
     }
 }
@@ -153,9 +230,15 @@ where
 
                     let fut = this.flow.service.call(req);
                     let config = this.config.clone();
+                    let open = this
+                        .idle
+                        .as_ref()
+                        .map(|idle| OpenStream::new(&idle.streams));
 
                     // multiplex request handling with spawn task
                     tokio::task::spawn_local(async move {
+                        let _open = open;
+
                         // resolve service call and send response.
                         let respond = async move {
                             match fut.await {
@@ -198,6 +281,19 @@ where
                     });
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
+
+                Poll::Pending
+                    if this
+                        .idle
+                        .as_mut()
+                        .is_some_and(|idle| idle.poll_idle(this.config.now(), cx)) =>
+                {
+                    this.idle = None;
+
+                    // Same path as server shutdown: GOAWAY, and `poll_accept` returns `None`
+                    // once the PING round trip is done and no stream is left.
+                    this.connection.graceful_shutdown();
+                }
 
                 Poll::Pending => match this.ping_pong.as_mut() {
                     Some(ping_pong) => loop {

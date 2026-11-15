@@ -151,3 +151,123 @@ async fn h2_handshake_timeout() -> io::Result<()> {
 
     Ok(())
 }
+
+/// Starts an h2 server with a 1 s keep-alive whose handler answers `/slow` with six chunks
+/// half a second apart (3 s in all) and anything else with an empty 200.
+fn idle_server() -> (std::net::SocketAddr, actix_server::ServerHandle) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let lst = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = lst.local_addr().unwrap();
+
+    std::thread::spawn(move || {
+        actix_rt::System::new().block_on(async move {
+            let srv = Server::build()
+                .disable_signals()
+                .workers(1)
+                .listen("h2_idle", lst, || {
+                    HttpService::build()
+                        .keep_alive(Duration::from_secs(1))
+                        .h2(|req: actix_http::Request| async move {
+                            if req.path() != "/slow" {
+                                return Ok::<_, Error>(Response::ok());
+                            }
+                            let body = async_stream::stream! {
+                                for _ in 0..6 {
+                                    actix_rt::time::sleep(Duration::from_millis(500)).await;
+                                    yield Ok::<_, Error>(bytes::Bytes::from_static(b"chunk"));
+                                }
+                            };
+                            Ok::<_, Error>(
+                                Response::ok()
+                                    .set_body(actix_http::body::BodyStream::new(body))
+                                    .map_into_boxed_body(),
+                            )
+                        })
+                        .tcp()
+                })
+                .unwrap()
+                .run();
+
+            tx.send(srv.handle()).unwrap();
+            srv.await
+        })
+    });
+
+    (addr, rx.recv().unwrap())
+}
+
+/// Opens an h2 connection whose client side is driven (so it answers PINGs) in a task, and
+/// returns the request handle and the task that ends when the server closes the connection.
+async fn idle_client(
+    addr: std::net::SocketAddr,
+) -> (
+    h2::client::SendRequest<bytes::Bytes>,
+    tokio::task::JoinHandle<()>,
+) {
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (tx, conn) = h2::client::handshake(stream).await.unwrap();
+    let closed = tokio::spawn(async move {
+        conn.await
+            .expect("connection closed with an error rather than a clean GOAWAY");
+    });
+    (tx, closed)
+}
+
+fn get(path: &str) -> ::http::Request<()> {
+    ::http::Request::get(format!("http://localhost{path}"))
+        .body(())
+        .unwrap()
+}
+
+/// A connection with no open stream is closed after keep-alive even though its client answers
+/// every PING, both after a request and when it never sends one.
+#[actix_rt::test]
+async fn h2_idle_connection_answering_pings_is_closed() {
+    let (addr, handle) = idle_server();
+
+    let (mut tx, closed) = idle_client(addr).await;
+    let (res, _) = tx.send_request(get("/"), true).unwrap();
+    assert_eq!(res.await.unwrap().status().as_u16(), 200);
+    // several PING rounds fit in the wait; without the idle close the connection outlives it.
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("idle connection still open after 5 s")
+        .unwrap();
+
+    let (_tx, closed) = idle_client(addr).await;
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("connection that never opened a stream still open after 5 s")
+        .unwrap();
+
+    handle.stop(false).await;
+}
+
+/// A stream that outlasts keep-alive is never cut by the idle close, and the idle period
+/// starts once it ends.
+#[actix_rt::test]
+async fn h2_open_stream_outlasting_keep_alive_is_not_cut() {
+    let (addr, handle) = idle_server();
+
+    let (mut tx, closed) = idle_client(addr).await;
+    let (res, _) = tx.send_request(get("/slow"), true).unwrap();
+    let res = res.await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+
+    let mut body = res.into_body();
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("stream cut before its body finished");
+        let _ = body.flow_control().release_capacity(chunk.len());
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, b"chunk".repeat(6));
+    assert!(!closed.is_finished(), "closed while the stream was open");
+
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("connection still open 5 s after its last stream ended")
+        .unwrap();
+
+    handle.stop(false).await;
+}

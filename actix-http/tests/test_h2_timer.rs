@@ -154,7 +154,11 @@ async fn h2_handshake_timeout() -> io::Result<()> {
 
 /// Starts an h2 server with a 1 s keep-alive and a 1 s send stall timeout whose handler answers
 /// `/slow` with six chunks half a second apart (3 s in all), `/gap` with two chunks 2 s apart,
-/// `/body` with a 5-byte body and anything else with an empty 200.
+/// `/body` with a 5-byte body, `/big` with one 64 KiB chunk, `/drip` with 64 KiB in 5-byte
+/// chunks and anything else with an empty 200.
+/// The size of `/big` and, to within a chunk, `/drip`.
+const BIG: usize = 64 * 1024;
+
 fn idle_server() -> (std::net::SocketAddr, actix_server::ServerHandle) {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let lst = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -173,6 +177,24 @@ fn idle_server() -> (std::net::SocketAddr, actix_server::ServerHandle) {
                             if req.path() == "/body" {
                                 return Ok::<_, Error>(
                                     Response::ok().set_body("hello").map_into_boxed_body(),
+                                );
+                            }
+                            if req.path() == "/big" {
+                                return Ok::<_, Error>(
+                                    Response::ok()
+                                        .set_body(vec![b'x'; BIG])
+                                        .map_into_boxed_body(),
+                                );
+                            }
+                            if req.path() == "/drip" {
+                                let body =
+                                    futures_util::stream::iter((0..BIG / 5).map(|_| {
+                                        Ok::<_, Error>(bytes::Bytes::from_static(b"drops"))
+                                    }));
+                                return Ok::<_, Error>(
+                                    Response::ok()
+                                        .set_body(actix_http::body::BodyStream::new(body))
+                                        .map_into_boxed_body(),
                                 );
                             }
                             if req.path() == "/gap" {
@@ -298,6 +320,8 @@ struct Held {
     closed_after: Option<Duration>,
     goaways: usize,
     resets: usize,
+    /// DATA payload bytes received.
+    data: usize,
 }
 
 /// h2's fixed payload for the PING it sends during graceful shutdown.
@@ -315,12 +339,15 @@ fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 /// A hand-written h2 client, so the test decides which PINGs it acks and what window it
 /// advertises (the h2 crate acks every PING). It acks SETTINGS and every PING except h2's
 /// shutdown one unless `ack_shutdown`; with `zero_window` it advertises
-/// SETTINGS_INITIAL_WINDOW_SIZE = 0 and never sends WINDOW_UPDATE; with `path` it sends one
-/// GET for it. Returns once the server closes the connection or after `limit`.
+/// SETTINGS_INITIAL_WINDOW_SIZE = 0 and, without `grant`, never sends WINDOW_UPDATE; with
+/// `grant = (n, every)` it opens the stream's and the connection's window by `n` bytes every
+/// `every` until the stream ends or is reset; with `path` it sends one GET for it. Returns once
+/// the server closes the connection or after `limit`.
 fn raw_hold(
     addr: std::net::SocketAddr,
     ack_shutdown: bool,
     zero_window: bool,
+    grant: Option<(u32, Duration)>,
     path: Option<&str>,
     limit: Duration,
 ) -> Held {
@@ -330,10 +357,11 @@ fn raw_hold(
     sock.set_read_timeout(Some(Duration::from_millis(50)))
         .unwrap();
     let start = std::time::Instant::now();
-    let closed = |goaways, resets| Held {
+    let closed = |goaways, resets, data| Held {
         closed_after: Some(start.elapsed()),
         goaways,
         resets,
+        data,
     };
 
     let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
@@ -357,15 +385,28 @@ fn raw_hold(
     let mut buf = Vec::new();
     let mut goaways = 0;
     let mut resets = 0;
+    let mut data = 0;
+    let mut stream_done = false;
+    let mut granted = std::time::Instant::now();
     let mut chunk = [0u8; 4096];
     while start.elapsed() < limit {
+        if let Some((n, every)) = grant {
+            if !stream_done && granted.elapsed() >= every {
+                granted = std::time::Instant::now();
+                let mut update = frame(0x8, 0, 1, &n.to_be_bytes());
+                update.extend(frame(0x8, 0, 0, &n.to_be_bytes()));
+                if sock.write_all(&update).is_err() {
+                    return closed(goaways, resets, data);
+                }
+            }
+        }
         match sock.read(&mut chunk) {
-            Ok(0) => return closed(goaways, resets),
+            Ok(0) => return closed(goaways, resets, data),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 continue
             }
-            Err(_) => return closed(goaways, resets),
+            Err(_) => return closed(goaways, resets, data),
         }
 
         while buf.len() >= 9 {
@@ -378,12 +419,19 @@ fn raw_hold(
             buf.drain(..9 + len);
 
             let reply = match kind {
+                0x0 => {
+                    data += len;
+                    // END_STREAM
+                    stream_done |= flags & 0x1 != 0;
+                    None
+                }
                 0x4 if flags & 0x1 == 0 => Some(frame(0x4, 0x1, 0, &[])),
                 0x6 if flags & 0x1 == 0 && (ack_shutdown || payload != SHUTDOWN_PING) => {
                     Some(frame(0x6, 0x1, 0, &payload))
                 }
                 0x3 => {
                     resets += 1;
+                    stream_done = true;
                     None
                 }
                 0x7 => {
@@ -394,7 +442,7 @@ fn raw_hold(
             };
             if let Some(reply) = reply {
                 if sock.write_all(&reply).is_err() {
-                    return closed(goaways, resets);
+                    return closed(goaways, resets, data);
                 }
             }
         }
@@ -404,6 +452,7 @@ fn raw_hold(
         closed_after: None,
         goaways,
         resets,
+        data,
     }
 }
 
@@ -414,11 +463,23 @@ async fn hold(
     zero_window: bool,
     path: Option<&'static str>,
 ) -> Held {
+    hold_granting(addr, ack_shutdown, zero_window, None, path).await
+}
+
+/// `hold` with a window `grant` (see `raw_hold`).
+async fn hold_granting(
+    addr: std::net::SocketAddr,
+    ack_shutdown: bool,
+    zero_window: bool,
+    grant: Option<(u32, Duration)>,
+    path: Option<&'static str>,
+) -> Held {
     tokio::task::spawn_blocking(move || {
         raw_hold(
             addr,
             ack_shutdown,
             zero_window,
+            grant,
             path,
             Duration::from_secs(8),
         )
@@ -485,6 +546,42 @@ async fn h2_zero_window_stream_does_not_hold_connection() {
         let held = hold(addr, ack_shutdown, true, Some("/body")).await;
         assert_closed(&held, Duration::from_secs(5), 2);
         assert_eq!(held.resets, 1, "{held:?}");
+    }
+    handle.stop(false).await;
+}
+
+/// A client that opens a zero window one byte at a time, just inside the stall timeout (1 s),
+/// no longer holds the stream: the credit drains across waits and refills only after 16 KiB
+/// sent, so the stream is reset after about 1 s of waiting and the idle close follows. The body
+/// is sent as one 64 KiB chunk (`/big`) and as 5-byte chunks (`/drip`), so finishing a small
+/// chunk does not refill the credit either. Before the credit each one-byte grant restarted the
+/// clock and the connection was held past the 8 s limit. hisn #4288.
+#[actix_rt::test]
+async fn h2_one_byte_window_trickle_is_reset() {
+    let (addr, handle) = idle_server();
+    for path in ["/big", "/drip"] {
+        let trickle = Some((1, Duration::from_millis(600)));
+        let held = hold_granting(addr, true, true, trickle, Some(path)).await;
+        assert_closed(&held, Duration::from_secs(5), 2);
+        assert_eq!(held.resets, 1, "{path}: {held:?}");
+        assert!(held.data < 16, "{path}: {held:?}");
+    }
+    handle.stop(false).await;
+}
+
+/// A slow but honest reader that opens its window 16 KiB at a time, each grant 0.6 s after the
+/// last, gets the whole 64 KiB body without a reset, in one chunk or in 5-byte chunks: each
+/// 16 KiB delivered refills the credit. hisn #4288.
+#[actix_rt::test]
+async fn h2_reader_granting_16k_at_a_time_is_not_reset() {
+    let (addr, handle) = idle_server();
+    for path in ["/big", "/drip"] {
+        let slow = Some((16 * 1024, Duration::from_millis(600)));
+        let held = hold_granting(addr, true, true, slow, Some(path)).await;
+        assert_eq!(held.resets, 0, "{path}: {held:?}");
+        let want = if path == "/big" { BIG } else { BIG / 5 * 5 };
+        assert_eq!(held.data, want, "{path}: {held:?}");
+        assert_closed(&held, Duration::from_secs(8), 2);
     }
     handle.stop(false).await;
 }

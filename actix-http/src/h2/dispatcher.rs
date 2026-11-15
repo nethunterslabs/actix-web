@@ -18,7 +18,7 @@ use bytes::{Bytes, BytesMut};
 use futures_core::ready;
 use h2::{
     server::{Connection, SendResponse},
-    Ping, PingPong,
+    Ping, PingPong, Reason,
 };
 use pin_project_lite::pin_project;
 use tokio::time::{sleep, Sleep};
@@ -45,6 +45,7 @@ pin_project! {
         peer_addr: Option<net::SocketAddr>,
         ping_pong: Option<H2PingPong>,
         idle: Option<H2Idle>,
+        hard_close: Option<Pin<Box<Sleep>>>,
         graceful_shutdown: Option<GracefulShutdownFuture>,
         _phantom: PhantomData<B>
     }
@@ -91,6 +92,7 @@ where
             conn_data: conn_data.0.map(Rc::new),
             ping_pong,
             idle,
+            hard_close: None,
             graceful_shutdown,
             _phantom: PhantomData,
         }
@@ -273,6 +275,11 @@ where
                                 DispatchError::SendData(err) => {
                                     tracing::warn!("Send data error: {err:?}");
                                 }
+                                DispatchError::SendStalled(stall) => {
+                                    tracing::debug!(
+                                        "Stream reset: no flow-control window for {stall:?}"
+                                    );
+                                }
                                 DispatchError::ResponseBody(err) => {
                                     tracing::error!("Response payload stream error: {err:?}");
                                 }
@@ -284,15 +291,37 @@ where
 
                 Poll::Pending
                     if this
+                        .hard_close
+                        .as_mut()
+                        .is_some_and(|timer| timer.as_mut().poll(cx).is_ready()) =>
+                {
+                    // The idle close's GOAWAY went out a keep-alive ago and the graceful close
+                    // has not finished, so the peer has not completed it. Close without waiting
+                    // for it: send GOAWAY(NO_ERROR) if the socket takes it, then drop the
+                    // connection either way.
+                    this.connection.abrupt_shutdown(Reason::NO_ERROR);
+                    let _ = Pin::new(&mut this.connection).poll_accept(cx);
+                    return Poll::Ready(Ok(()));
+                }
+
+                Poll::Pending
+                    if this
                         .idle
                         .as_mut()
                         .is_some_and(|idle| idle.poll_idle(this.config.now(), cx)) =>
                 {
-                    this.idle = None;
-
                     // Same path as server shutdown: GOAWAY, and `poll_accept` returns `None`
                     // once the PING round trip is done and no stream is left.
                     this.connection.graceful_shutdown();
+
+                    // A peer that never completes that close is closed one keep-alive later,
+                    // whatever h2 does with the shutdown PING meanwhile (hisn #4284).
+                    if let Some(mut idle) = this.idle.take() {
+                        idle.timer
+                            .as_mut()
+                            .reset((this.config.now() + idle.dur).into());
+                        this.hard_close = Some(idle.timer);
+                    }
                 }
 
                 Poll::Pending => match this.ping_pong.as_mut() {
@@ -336,6 +365,7 @@ where
 enum DispatchError {
     SendResponse(h2::Error),
     SendData(h2::Error),
+    SendStalled(Duration),
     ResponseBody(Box<dyn StdError>),
 }
 
@@ -351,6 +381,7 @@ where
     let (res, body) = res.replace_body(());
 
     // prepare response.
+    let stall = config.h2_send_stall_timeout();
     let mut size = body.size();
     let res = prepare_response(config, res.head(), &mut size);
     let eof_or_head = size.is_eof() || head_req;
@@ -376,7 +407,21 @@ where
             // reserve enough space and wait for stream ready.
             stream.reserve_capacity(chunk_size);
 
-            match poll_fn(|cx| stream.poll_capacity(cx)).await {
+            // A peer that keeps its window shut would hold the stream, and with it the
+            // connection, for ever: reset the stream once it has waited the stall timeout.
+            let capacity = poll_fn(|cx| stream.poll_capacity(cx));
+            let capacity = match stall {
+                None => capacity.await,
+                Some(stall) => match tokio::time::timeout(stall, capacity).await {
+                    Ok(capacity) => capacity,
+                    Err(_) => {
+                        stream.send_reset(Reason::CANCEL);
+                        return Err(DispatchError::SendStalled(stall));
+                    }
+                },
+            };
+
+            match capacity {
                 // No capacity left. drop body and return.
                 None => return Ok(()),
 

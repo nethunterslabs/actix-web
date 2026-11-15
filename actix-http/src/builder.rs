@@ -30,6 +30,7 @@ pub struct HttpServiceBuilder<T, S, X = ExpectHandler, U = UpgradeHandler> {
     h2_stream_window_size: u32,
     h2_max_header_list_size: Option<u32>,
     h2_max_concurrent_streams: Option<u32>,
+    h2_send_stall_timeout: Option<Duration>,
     graceful_shutdown_signal: Option<GracefulShutdownSignal>,
     expect: X,
     upgrade: Option<U>,
@@ -59,6 +60,7 @@ where
             h2_stream_window_size: DEFAULT_H2_STREAM_WINDOW_SIZE,
             h2_max_header_list_size: None,
             h2_max_concurrent_streams: None,
+            h2_send_stall_timeout: None,
             graceful_shutdown_signal: None,
 
             // dispatcher parts
@@ -224,6 +226,14 @@ where
         self
     }
 
+    /// Sets how long an HTTP/2 response may wait for the peer to open its flow-control window.
+    ///
+    /// See [`ServiceConfigBuilder::h2_send_stall_timeout`] for more details.
+    pub fn h2_send_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.h2_send_stall_timeout = Some(timeout);
+        self
+    }
+
     /// Provide service for `EXPECT: 100-Continue` support.
     ///
     /// Service get called with request that contains `EXPECT: 100-Continue` header.
@@ -249,6 +259,7 @@ where
             h2_stream_window_size: self.h2_stream_window_size,
             h2_max_header_list_size: self.h2_max_header_list_size,
             h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_send_stall_timeout: self.h2_send_stall_timeout,
             graceful_shutdown_signal: self.graceful_shutdown_signal,
             expect: expect.into_factory(),
             upgrade: self.upgrade,
@@ -281,6 +292,7 @@ where
             h2_stream_window_size: self.h2_stream_window_size,
             h2_max_header_list_size: self.h2_max_header_list_size,
             h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_send_stall_timeout: self.h2_send_stall_timeout,
             graceful_shutdown_signal: self.graceful_shutdown_signal,
             expect: self.expect,
             upgrade: Some(upgrade.into_factory()),
@@ -324,6 +336,7 @@ where
             .h2_initial_connection_window_size(self.h2_conn_window_size)
             .h2_max_header_list_size(self.h2_max_header_list_size)
             .h2_max_concurrent_streams(self.h2_max_concurrent_streams)
+            .h2_send_stall_timeout(self.h2_send_stall_timeout)
             .graceful_shutdown_signal(self.graceful_shutdown_signal)
             .build();
 
@@ -357,6 +370,7 @@ where
             .h2_initial_connection_window_size(self.h2_conn_window_size)
             .h2_max_header_list_size(self.h2_max_header_list_size)
             .h2_max_concurrent_streams(self.h2_max_concurrent_streams)
+            .h2_send_stall_timeout(self.h2_send_stall_timeout)
             .graceful_shutdown_signal(self.graceful_shutdown_signal)
             .build();
 
@@ -387,6 +401,7 @@ where
             .h2_initial_connection_window_size(self.h2_conn_window_size)
             .h2_max_header_list_size(self.h2_max_header_list_size)
             .h2_max_concurrent_streams(self.h2_max_concurrent_streams)
+            .h2_send_stall_timeout(self.h2_send_stall_timeout)
             .graceful_shutdown_signal(self.graceful_shutdown_signal)
             .build();
 

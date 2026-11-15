@@ -397,6 +397,14 @@ where
 
     let mut body = pin!(body);
 
+    // The stall timeout is a credit of window-blocked time, not a timer per wait: it drains only
+    // while the stream waits for window and refills only after a further CHUNK_SIZE bytes have
+    // gone out. h2 wakes `poll_capacity` on any window increase, so a per-wait timer restarted
+    // on a one-byte WINDOW_UPDATE just inside it and held the stream for as many waits as the
+    // body has bytes. Time spent waiting on `body` does not count.
+    let mut credit = stall;
+    let mut sent_since_refill = 0;
+
     // poll response body and send chunks to client
     while let Some(res) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
         let mut chunk = res.map_err(|err| DispatchError::ResponseBody(err.into()))?;
@@ -407,18 +415,24 @@ where
             // reserve enough space and wait for stream ready.
             stream.reserve_capacity(chunk_size);
 
-            // A peer that keeps its window shut would hold the stream, and with it the
-            // connection, for ever: reset the stream once it has waited the stall timeout.
+            // A peer that keeps its window shut, or opens it a byte at a time, would hold the
+            // stream, and with it the connection: reset the stream once its credit is spent.
             let capacity = poll_fn(|cx| stream.poll_capacity(cx));
-            let capacity = match stall {
-                None => capacity.await,
-                Some(stall) => match tokio::time::timeout(stall, capacity).await {
-                    Ok(capacity) => capacity,
-                    Err(_) => {
-                        stream.send_reset(Reason::CANCEL);
-                        return Err(DispatchError::SendStalled(stall));
+            let capacity = match (stall, credit) {
+                (Some(stall), Some(left)) => {
+                    let waited = tokio::time::Instant::now();
+                    match tokio::time::timeout(left, capacity).await {
+                        Ok(capacity) => {
+                            credit = Some(left.saturating_sub(waited.elapsed()));
+                            capacity
+                        }
+                        Err(_) => {
+                            stream.send_reset(Reason::CANCEL);
+                            return Err(DispatchError::SendStalled(stall));
+                        }
                     }
-                },
+                }
+                _ => capacity.await,
             };
 
             match capacity {
@@ -432,9 +446,15 @@ where
                     let len = chunk.len();
                     let bytes = chunk.split_to(cmp::min(len, cap));
 
+                    sent_since_refill += bytes.len();
                     stream
                         .send_data(bytes, false)
                         .map_err(DispatchError::SendData)?;
+
+                    if sent_since_refill >= CHUNK_SIZE {
+                        sent_since_refill = 0;
+                        credit = stall;
+                    }
 
                     // Current chuck completely sent. break send loop and poll next one.
                     if chunk.is_empty() {

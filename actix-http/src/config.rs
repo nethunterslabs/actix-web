@@ -197,10 +197,12 @@ impl ServiceConfigBuilder {
 
     /// Sets how long an HTTP/2 response may wait for the peer to open its flow-control window.
     ///
-    /// A response stream that has data to send and gets no window from the peer for this long
-    /// is reset with `RST_STREAM(CANCEL)`; the connection and its other streams carry on. The
-    /// clock runs only while the stream waits for window, so a handler that is slow to produce
-    /// its body is never cut by it, and it starts again each time window arrives.
+    /// Each response stream has this much waiting time as a credit. It drains only while the
+    /// stream has data to send and waits for window, so a handler that is slow to produce its
+    /// body is never cut by it, and it refills only after each further 16 KiB the stream sends,
+    /// so a peer that opens its window a byte at a time cannot keep restarting it. A stream whose
+    /// credit runs out is reset with `RST_STREAM(CANCEL)`; the connection and its other streams
+    /// carry on.
     ///
     /// The default value of `None` waits for ever, which keeps today's behaviour.
     pub fn h2_send_stall_timeout(mut self, timeout: Option<Duration>) -> Self {
